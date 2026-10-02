@@ -1,0 +1,15 @@
+name: publish
+on:
+  release:
+    types: [published]
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi          # configure this environment + a Trusted Publisher on pypi.org
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: uv publish        # uses Trusted Publishing, no API token
