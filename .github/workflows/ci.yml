@@ -6,6 +6,16 @@ jobs:
     strategy:
       matrix:
         python: ["3.11", "3.12", "3.13", "3.14"]
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: pg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CRUDCDC_TEST_PG_URL: postgresql+asyncpg://postgres:pg@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

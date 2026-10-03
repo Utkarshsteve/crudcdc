@@ -1,55 +1,95 @@
 # crudcdc
 
-Async CRUD on SQLAlchemy 2.1 with a built-in **change data capture feed** that consumers can read.
+Change data capture for SQLAlchemy 2.1 (async), with a change feed that consumers read.
 
-Every create/update/delete is recorded in a `crudcdc_changes` table **in the same transaction** as
-the write (the outbox pattern), so a change is in the feed if and only if the write committed.
+Every ORM insert, update and delete on a tracked model is recorded in a `crudcdc_changes` table
+**in the same transaction** as the write (the outbox pattern). Cascades, relationship changes and
+plain `session.add` are all captured. A change is in the feed if and only if its write committed.
 
 ```python
-from crudcdc import AsyncCRUD, CDCBase, ChangeFeed
+import crudcdc
+from crudcdc import CDCBase, ChangeFeed
 
-users = AsyncCRUD(User)  # User is your SQLAlchemy model
-await conn.run_sync(CDCBase.metadata.create_all)
+crudcdc.track(Base)                       # every model of this declarative base
+async with engine.begin() as conn:
+    await conn.run_sync(CDCBase.metadata.create_all)
 
-async with session.begin():
-    u = await users.create(session, name="ada")
-    await users.update(session, u.id, name="grace")
-
-feed = ChangeFeed(session)
-batch = await feed.read_for("billing", limit=100)  # resumes from this consumer's offset
-for change in batch.changes:  # ordered by seq
-    print(change.op, change.table_name, change.pk, change.before, change.after)
-await feed.ack("billing", batch.next_cursor)  # commit your session to persist the offset
+async with Session() as s:                # any AsyncSession: nothing else to install
+    user = await s.get(User, 1)
+    user.name = "grace"
+    await s.commit()
 ```
 
-- **Pull:** `read(since=cursor)` or `read_for(consumer)` + `ack(consumer, cursor)`. Delivery is
-  at-least-once; consumers keep their own offsets.
-- **Retention:** `prune(older_than=...)` never deletes rows a registered consumer hasn't acked.
-- **Payload:** `op`, `table_name`, `pk`, `before`, `after` (JSON), `created_at`. Pass
-  `AsyncCRUD(Model, track_before=False)` to skip `before`.
+## Reading the feed
+
+```python
+async with Session() as s:
+    feed = ChangeFeed(s)
+    batch = await feed.read_for("billing", limit=100)   # resumes from the stored offset
+    for e in batch.events:
+        print(e.op, e.table, e.pk, e.changed, e.before, e.after)
+    if batch.next_cursor:
+        await feed.ack("billing", batch.next_cursor)
+    await s.commit()
+```
+
+**Exactly-once processing:** offsets live in the same database. Write your results and `ack` in
+the same transaction, and either both happen or neither does. If a worker crashes before
+committing, the batch is delivered again.
+
+- `read_for` holds the consumer until the transaction ends. A second worker on the same name
+  gets an empty batch (Postgres) or waits (SQLite). Keep batches quick.
+- `read(since=cursor)` reads without offsets. Cursors are opaque strings; store them as-is.
+- `prune(older_than)` deletes old events, never past the slowest consumer. `forget(name)` drops a
+  consumer that no longer exists.
+
+## Events
+
+```python
+ChangeEvent(
+    seq=42,                          # unique event id
+    op="update",                     # insert | update | delete
+    table="users",                   # schema-qualified when the table has a schema
+    pk={"id": 1},
+    before={"id": 1, "name": "ada"}, # None for insert, or with track(Model, track_before=False)
+    after={"id": 1, "name": "grace"},# None for delete
+    changed=("name",),
+    tx_id="1234",                    # same for every event of one transaction
+    changed_at=datetime(...),        # UTC: transaction start on Postgres, write time on SQLite
+)
+```
+
+Keys are database column names. Values are JSON: enums become their value, dates ISO strings,
+`Decimal`/`UUID` strings, bytes hex. Other types: `crudcdc.register_encoder(MyType, fn)`; until
+then writing one raises `EncodingError` and the transaction rolls back.
+
+## Not captured
+
+- Raw SQL (`text(...)`) and writes from other services.
+- Bulk ORM statements (`update(User)...`, `delete(User)...`). On a tracked table these **raise**
+  `UntrackedWriteError`; add `.execution_options(crudcdc_untracked=True)` to run one anyway.
+- Database-level `ON DELETE CASCADE` with `passive_deletes=True`.
+
+On Postgres, a long-running transaction holds back events committed after it started, until it
+ends. That's what guarantees no consumer skips an event.
+
+Migrations: include `CDCBase.metadata` in your Alembic `target_metadata`.
 
 ## Install
 
 ```
-pip install crudcdc[sqlite]     # aiosqlite
-pip install crudcdc[postgres]   # asyncpg
+pip install "crudcdc[postgres]"   # asyncpg
+pip install "crudcdc[sqlite]"     # aiosqlite
 ```
 
 Python 3.11+, SQLAlchemy 2.1+.
-
-## Known limitations (v0.1)
-
-- Writes made outside `AsyncCRUD` (raw SQL, other services) are not captured. A Postgres logical
-  replication backend is planned.
-- On Postgres, concurrent transactions can commit sequence numbers out of order, so a reader can
-  skip a row. A snapshot-aware reader (`pg_snapshot_xmin`) is planned. SQLite is single-writer and
-  unaffected.
-- No push sinks yet (webhook / callback relay next, Kafka and Redis as extras later).
 
 ## Development
 
 ```
 uv sync
-uv run pytest
+docker run -d --name crudcdc-pg -e POSTGRES_PASSWORD=pg -p 55432:5432 postgres:17-alpine
+export CRUDCDC_TEST_PG_URL=postgresql+asyncpg://postgres:pg@localhost:55432/postgres
+uv run pytest                     # Postgres tests skip if the variable isn't set
 uv run ruff check . && uv run mypy src
 ```

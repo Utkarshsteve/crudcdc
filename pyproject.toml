@@ -1,7 +1,7 @@
 [project]
 name = "crudcdc"
 version = "0.1.0"
-description = "Async CRUD on SQLAlchemy with a built-in change data capture (CDC) feed that consumers can read."
+description = "Change data capture for async SQLAlchemy: every ORM write recorded in the same transaction, read as a change feed."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
