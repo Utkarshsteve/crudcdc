@@ -175,15 +175,13 @@ async def test_encoding_error_rolls_back_the_write(session: AsyncSession) -> Non
 
 
 async def test_register_encoder(session: AsyncSession) -> None:
-    register_encoder(Money, lambda m: m.cents)
-    try:
-        session.add(Wallet(id=1, balance=Money(500)))
-        await session.commit()
-        assert (await events(session))[0].after == {"id": 1, "balance": 500}
-    finally:
-        from crudcdc.capture import _encoders
+    class Coins(Money):  # registrations are global: keep plain Money unregistered
+        pass
 
-        _encoders.pop(Money)
+    register_encoder(Coins, lambda m: m.cents)
+    session.add(Wallet(id=1, balance=Coins(500)))
+    await session.commit()
+    assert (await events(session))[0].after == {"id": 1, "balance": 500}
 
 
 async def test_bulk_statements_raise(session: AsyncSession) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import enum
+import functools
 import uuid
 from collections.abc import Callable
 from typing import Any, cast
@@ -18,7 +19,6 @@ from .models import Change
 
 _models: dict[Mapper[Any], bool] = {}  # mapper -> track_before
 _registries: dict[Any, bool] = {}  # registry of a tracked declarative base -> track_before
-_encoders: dict[type, Callable[[Any], Any]] = {}
 _BEFORE = "_crudcdc_before"
 _TX = "_crudcdc_tx"
 
@@ -38,8 +38,8 @@ def track(*targets: type[Any], track_before: bool = True) -> None:
 
 
 def register_encoder(type_: type, fn: Callable[[Any], Any]) -> None:
-    """Teach the change feed how to turn values of ``type_`` into JSON."""
-    _encoders[type_] = fn
+    """Teach the change feed how to turn values of ``type_`` (and subclasses) into JSON."""
+    _encode.register(type_, lambda value: _encode(fn(value)))
 
 
 def _table(mapper: Mapper[Any]) -> str:
@@ -53,25 +53,44 @@ def _track_before(mapper: Mapper[Any]) -> bool | None:
     return _registries.get(mapper.registry)
 
 
+@functools.singledispatch
 def _encode(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, enum.Enum):
-        return _encode(value.value)
-    if isinstance(value, (dt.datetime, dt.date, dt.time)):
-        return value.isoformat()
-    if isinstance(value, (decimal.Decimal, uuid.UUID)):
-        return str(value)
-    if isinstance(value, bytes):
-        return value.hex()
-    if isinstance(value, dict):
-        return {str(k): _encode(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_encode(v) for v in value]
-    for cls in type(value).__mro__:
-        if cls in _encoders:
-            return _encode(_encoders[cls](value))
     raise EncodingError(f"can't encode {type(value).__name__!r}; use crudcdc.register_encoder")
+
+
+@_encode.register
+def _(value: bool | int | float | str | None) -> Any:
+    return value
+
+
+@_encode.register
+def _(value: enum.Enum) -> Any:
+    return _encode(value.value)
+
+
+@_encode.register
+def _(value: dt.date | dt.time) -> str:  # dt.datetime is a dt.date
+    return value.isoformat()
+
+
+@_encode.register
+def _(value: decimal.Decimal | uuid.UUID) -> str:
+    return str(value)
+
+
+@_encode.register
+def _(value: bytes) -> str:
+    return value.hex()
+
+
+@_encode.register
+def _(value: dict) -> dict[str, Any]:  # type: ignore[type-arg]
+    return {str(k): _encode(v) for k, v in value.items()}
+
+
+@_encode.register
+def _(value: list | tuple) -> list[Any]:  # type: ignore[type-arg]
+    return [_encode(v) for v in value]
 
 
 def _columns(mapper: Mapper[Any]) -> list[tuple[str, str]]:
