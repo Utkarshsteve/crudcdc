@@ -3,7 +3,7 @@ title: crudcdc v0.1 core redesign spec
 type: spec
 project: "[[crudcdc]]"
 created: 2026-10-03
-status: approved design, not yet implemented
+status: implemented 2026-10-03 (see §9 for deviations)
 repo_copy: ~/Projects/crudcdc/docs/specs/2026-10-03-core-redesign.md
 tags: [crudcdc, spec, design]
 ---
@@ -53,15 +53,15 @@ Unchanged from [[Design-Decisions]]: async only, Python ≥3.11, SQLAlchemy ≥2
 ```python
 @dataclass(frozen=True, slots=True)
 class ChangeEvent:
-    seq: int  # unique event id (not the cursor; see D5a)
+    seq: int                          # unique event id (not the cursor; see D5a)
     op: Literal["insert", "update", "delete"]
-    table: str  # Table.fullname: "users", or "billing.invoices" with a schema
-    pk: dict[str, Any]  # {"id": 5}; composite: {"org_id": 1, "user_id": 7}
-    before: dict[str, Any] | None  # None for insert, and for update/delete when track_before=False
-    after: dict[str, Any] | None  # None for delete
-    changed: tuple[str, ...]  # update: changed column names; insert/delete: ()
-    tx_id: str  # same value for every event of one transaction
-    changed_at: datetime  # UTC, database clock (see below)
+    table: str                        # Table.fullname: "users", or "billing.invoices" with a schema
+    pk: dict[str, Any]                # {"id": 5}; composite: {"org_id": 1, "user_id": 7}
+    before: dict[str, Any] | None     # None for insert, and for update/delete when track_before=False
+    after: dict[str, Any] | None      # None for delete
+    changed: tuple[str, ...]          # update: changed column names; insert/delete: ()
+    tx_id: str                        # same value for every event of one transaction
+    changed_at: datetime              # UTC, database clock (see below)
 ```
 
 - Keys in `pk`, `before`, `after` and `changed` are **database column names**.
@@ -129,3 +129,13 @@ This shape is frozen by a contract test (§7). Changing it after publishing is a
 **In 0.1:** everything in §2–§7, and a README rewritten around `track()`, with the "exactly-once: `ack` in the same transaction as your results" pattern as a main example and a "what is not captured" list.
 
 **Out of 0.1** (roadmap): push sinks / webhook relay, Postgres logical replication backend, sync API, timed leases for slow consumers, expanding bulk statements into per-row events, Alembic helpers (the docs explain including `CDCBase.metadata` in migrations).
+
+## 9. Implementation notes (2026-10-03)
+
+Built as planned in [[Plan-v0.1]]; 75 tests pass on SQLite and Postgres 17 (Python 3.11, 3.13, 3.14). Deviations from the text above:
+
+- **SQLite `read_for`:** SQLite has no row locks, so a second worker on the same consumer **waits** for the first to commit instead of getting an empty batch. Still no duplicates. (§6 said "empty batch" for both backends.)
+- **First read of a new consumer name:** if two workers read a never-seen consumer at the same moment, the second waits for the first to commit (Postgres blocks on the new row). After that, the empty-batch behavior applies.
+- **Collection moves:** moving an object between collections (`p1.kids.remove(k); p2.kids.append(k)`, or a new parent adopting it) only sets its foreign key during the flush, so `before_flush` also records before-images for objects added to or removed from a new or dirty object's relationships.
+- **Before-image of a value set without loading the old one** (expired attribute): read from the database in `before_flush`, one `SELECT` per such object.
+- **Modules:** 6, not 8 (`tracking` + `encoding` merged into `capture.py`; `events` + `cursor` into `feed.py`).

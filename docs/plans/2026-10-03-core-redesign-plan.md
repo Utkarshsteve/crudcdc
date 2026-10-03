@@ -4,7 +4,7 @@ type: plan
 project: "[[crudcdc]]"
 spec: "[[Spec-v0.1]]"
 created: 2026-10-03
-status: awaiting go-ahead
+status: done 2026-10-03
 repo_copy: ~/Projects/crudcdc/docs/plans/2026-10-03-core-redesign-plan.md
 tags: [crudcdc, plan]
 ---
@@ -37,3 +37,11 @@ Test-first: each task starts with tests that fail, then the minimum code to pass
 - **`after_flush` inserts on the session's connection** while async: these must stay synchronous `connection.execute` calls inside the greenlet. If SQLAlchemy 2.1 rejects that, fall back to `after_flush_postexec` plus a second flush.
 - **`pg_snapshot_xmin` and the reader's own transaction:** `FOR UPDATE` gives the reader a transaction ID. That doesn't matter, because changes older than it are already below the bound, but the task-5 tests cover it.
 - **Before-images of expired objects:** reading them in `before_flush` triggers a load. That's fine in a greenlet, but verify it on Postgres.
+
+## Outcome (2026-10-03)
+All tasks done. Commits: `5577a1b` (task 0), `17b1cb0` (tasks 1–6 together: the new `Change` table breaks the old feed, so they couldn't land separately), `7eed19f` (task 7). 75 passed, 4 skipped (Postgres-only tests on the SQLite run).
+
+Hit along the way:
+- Relationship moves weren't captured at first: the foreign key is set mid-flush. Fixed by scanning relationship history in `before_flush` (spec §9).
+- A test hung: two workers creating the same new consumer row in one task. `read_for` now checks before inserting; first-ever concurrent reads wait (spec §9).
+- Test-only bugs: tz-aware datetime into a naive column (Postgres rejects it), async lazy load of an uninitialised collection, multi-statement `text()` on asyncpg.
