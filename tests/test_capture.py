@@ -245,3 +245,26 @@ async def test_schema_qualified_table(session: AsyncSession) -> None:
     session.add(Invoice(id=1))
     await session.commit()
     assert (await events(session))[0].table == "billing.invoices"
+
+
+async def test_track_before_false_still_sees_collection_moves(session: AsyncSession) -> None:
+    from crudcdc import track
+
+    track(Kid, track_before=False)
+    try:
+        p1, p2, kid = Parent(id=1, name="a"), Parent(id=2, name="b", kids=[]), Kid(id=1)
+        p1.kids.append(kid)
+        session.add_all([p1, p2])
+        await session.commit()
+        p1.kids.remove(kid)
+        p2.kids.append(kid)  # parent_id is only set during the flush
+        await session.commit()
+        last = (await events(session))[-1]
+        assert (last.table, last.op, last.before, last.changed) == (
+            "kids",
+            "update",
+            None,
+            ("parent_id",),
+        )
+    finally:
+        track(Kid)

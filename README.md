@@ -75,6 +75,12 @@ ends. That's what guarantees no consumer skips an event.
 
 Migrations: include `CDCBase.metadata` in your Alembic `target_metadata`.
 
+## Performance
+
+A tracked write also inserts its change row in the same transaction. On an M5 Pro with Postgres 17
+in Docker: **+25–38% per single-row transaction**, +85–97% for 1,000-row transactions. Details,
+method and SQLite numbers: [bench/RESULTS.md](bench/RESULTS.md).
+
 ## Install
 
 ```

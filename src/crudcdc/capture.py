@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any, cast
 
-from sqlalchemy import Table, event, insert, inspect, select, text
+from sqlalchemy import Table, event, insert, inspect, literal_column, select
 from sqlalchemy.orm import Mapper, ORMExecuteState, Session, UOWTransaction
 from sqlalchemy.orm.state import InstanceState
 
@@ -93,14 +93,25 @@ def _(value: list | tuple) -> list[Any]:  # type: ignore[type-arg]
     return [_encode(v) for v in value]
 
 
-def _columns(mapper: Mapper[Any]) -> list[tuple[str, str]]:
+@functools.cache
+def _columns(mapper: Mapper[Any]) -> tuple[tuple[str, str], ...]:
     """(attribute key, column name) for every mapped column."""
-    return [(p.key, p.columns[0].name) for p in mapper.column_attrs]
+    return tuple((p.key, p.columns[0].name) for p in mapper.column_attrs)
+
+
+@functools.cache
+def _identity_keys(mapper: Mapper[Any]) -> frozenset[str]:
+    """Attribute keys of primary and foreign key columns."""
+    return frozenset(
+        p.key for p in mapper.column_attrs if p.columns[0].primary_key or p.columns[0].foreign_keys
+    )
 
 
 def _row(state: InstanceState[Any], values: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for key, name in _columns(state.mapper):
+        if key not in values:
+            continue
         try:
             out[name] = _encode(values[key])
         except EncodingError as e:
@@ -112,10 +123,10 @@ def _current(state: InstanceState[Any]) -> dict[str, Any]:
     return {key: getattr(state.obj(), key) for key, _ in _columns(state.mapper)}
 
 
-def _old_values(session: Session, state: InstanceState[Any]) -> dict[str, Any]:
-    """Column values as they are in the database, before this flush."""
+def _old_values(session: Session, state: InstanceState[Any], keys: list[str]) -> dict[str, Any]:
+    """Values of ``keys`` as they are in the database, before this flush."""
     values, unknown = {}, []
-    for key, _ in _columns(state.mapper):
+    for key in keys:
         hist = state.attrs[key].history
         if hist.deleted:
             values[key] = hist.deleted[0]
@@ -145,9 +156,16 @@ def _before_flush(session: Session, _ctx: UOWTransaction, _instances: object) ->
             candidates += [o for o in (*hist.added, *hist.deleted) if o is not None]
     for obj in dict.fromkeys(candidates):
         state = inspect(obj)
-        if _track_before(state.mapper) is None or state.key is None:
+        keep_before = _track_before(state.mapper)
+        if keep_before is None or state.key is None:
             continue
-        befores[state] = _row(state, _old_values(session, state))
+        keys = [key for key, _ in _columns(state.mapper)]
+        if not keep_before:
+            # Only what's needed to find the changed columns and the primary key. Foreign keys
+            # are always included: a move between collections sets them later, during the flush.
+            identity = _identity_keys(state.mapper)
+            keys = [k for k in keys if k in identity or state.attrs[k].history.has_changes()]
+        befores[state] = _row(state, _old_values(session, state, keys))
     session.info[_BEFORE] = befores
 
 
@@ -155,52 +173,64 @@ def _pk(state: InstanceState[Any], row: dict[str, Any]) -> dict[str, Any]:
     return {c.name: row[c.name] for c in state.mapper.primary_key}
 
 
-def _order(state: InstanceState[Any]) -> int:
-    # ponytail: re-sorts tables per object; cache per flush if huge flushes show up in profiles
-    table = cast(Table, state.mapper.local_table)
-    tables = table.metadata.sorted_tables
-    return tables.index(table) if table in tables else 0
+def _table_ranks(states: list[InstanceState[Any]]) -> dict[Table, int]:
+    """Dependency order of the tables involved: parents before children."""
+    ranks: dict[Table, int] = {}
+    for metadata in {cast(Table, s.mapper.local_table).metadata for s in states}:
+        ranks.update((t, i) for i, t in enumerate(metadata.sorted_tables))
+    return ranks
 
 
 def _after_flush(session: Session, _ctx: UOWTransaction) -> None:
     befores = session.info.pop(_BEFORE, {})
+    new = [inspect(o) for o in session.new]
+    dirty = [inspect(o) for o in session.dirty]
+    deleted = [inspect(o) for o in session.deleted]
+    tracked = [s for s in (*new, *dirty, *deleted) if _track_before(s.mapper) is not None]
+    if not tracked:
+        return
+    ranks = _table_ranks(tracked)
+
+    def rank(state: InstanceState[Any]) -> int:
+        return ranks.get(cast(Table, state.mapper.local_table), 0)
+
     rows: list[dict[str, Any]] = []
-    deletes: list[dict[str, Any]] = []
     # Flush order: parents before children for inserts/updates, children first for deletes.
-    for obj in sorted(session.new, key=lambda o: _order(inspect(o))):
-        state = inspect(obj)
+    for state in sorted(new, key=rank):
         if _track_before(state.mapper) is not None:
             after = _row(state, _current(state))
             rows.append(_change("insert", state, None, after, (), _pk(state, after)))
-    for obj in sorted(session.dirty, key=lambda o: _order(inspect(o))):
-        state = inspect(obj)
+    for state in sorted(dirty, key=rank):
         keep_before = _track_before(state.mapper)
         if keep_before is None or state not in befores:
             continue
         before, after = befores[state], _row(state, _current(state))
-        changed = tuple(k for k in after if after[k] != before.get(k))
+        changed = tuple(k for k in after if k in before and after[k] != before[k])
         if changed:
             kept = before if keep_before else None
             rows.append(_change("update", state, kept, after, changed, _pk(state, after)))
-    for obj in sorted(session.deleted, key=lambda o: -_order(inspect(o))):
-        state = inspect(obj)
+    for state in sorted(deleted, key=rank, reverse=True):
         keep_before = _track_before(state.mapper)
         if keep_before is None or state not in befores:
             continue
         before = befores[state]
-        deletes.append(
+        rows.append(
             _change("delete", state, before if keep_before else None, None, (), _pk(state, before))
         )
-    rows += deletes
     if not rows:
         return
     conn = session.connection()
+    stmt = insert(Change)
     if conn.dialect.name == "postgresql":
-        xid = int(conn.execute(text("select pg_current_xact_id()::text")).scalar_one())
-        tx_id = str(xid)
+        # The database fills in the transaction id: no separate round trip to fetch it.
+        stmt = stmt.values(
+            xid=literal_column("pg_current_xact_id()::text::bigint"),
+            tx_id=literal_column("pg_current_xact_id()::text"),
+        )
     else:
-        xid, tx_id = 0, session.info.setdefault(_TX, uuid.uuid4().hex)
-    conn.execute(insert(Change), [{**r, "xid": xid, "tx_id": tx_id} for r in rows])
+        tx_id = session.info.setdefault(_TX, uuid.uuid4().hex)
+        rows = [{**r, "xid": 0, "tx_id": tx_id} for r in rows]
+    conn.execute(stmt, rows)
 
 
 def _change(
