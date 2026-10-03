@@ -1,15 +1,19 @@
 name: publish
 on:
+  workflow_dispatch:           # run manually: publishes to TestPyPI
   release:
-    types: [published]
+    types: [published]         # a GitHub release: publishes to PyPI
 jobs:
-  pypi:
+  publish:
     runs-on: ubuntu-latest
-    environment: pypi          # configure this environment + a Trusted Publisher on pypi.org
+    # Each environment needs a matching Trusted Publisher on (test.)pypi.org: no API tokens.
+    environment: ${{ github.event_name == 'release' && 'pypi' || 'testpypi' }}
     permissions:
       id-token: write
+    env:
+      UV_PUBLISH_URL: ${{ github.event_name == 'release' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv build
-      - run: uv publish        # uses Trusted Publishing, no API token
+      - run: uv publish --trusted-publishing always
