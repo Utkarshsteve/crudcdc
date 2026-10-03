@@ -9,7 +9,8 @@ jobs:
     # Each environment needs a matching Trusted Publisher on (test.)pypi.org: no API tokens.
     environment: ${{ github.event_name == 'release' && 'pypi' || 'testpypi' }}
     permissions:
-      id-token: write
+      contents: read             # checkout of a private repo
+      id-token: write            # Trusted Publishing
     env:
       UV_PUBLISH_URL: ${{ github.event_name == 'release' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
     steps:
