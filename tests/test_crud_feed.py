@@ -1,36 +1,12 @@
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
-import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from crudcdc import AsyncCRUD, CDCBase, ChangeFeed
+from crudcdc import AsyncCRUD, ChangeFeed
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-class User(Base):
-    __tablename__ = "users"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str]
-    joined: Mapped[datetime | None] = mapped_column(default=None)
-
+from .models import User
 
 users = AsyncCRUD(User)
-
-
-@pytest.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine("sqlite+aiosqlite://")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(CDCBase.metadata.create_all)
-    async with async_sessionmaker(engine, expire_on_commit=False)() as s:
-        yield s
-    await engine.dispose()
 
 
 async def test_crud_roundtrip(session: AsyncSession) -> None:
@@ -44,7 +20,7 @@ async def test_crud_roundtrip(session: AsyncSession) -> None:
 
 
 async def test_feed_records_each_write_in_order(session: AsyncSession) -> None:
-    u = await users.create(session, name="ada", joined=datetime(2026, 1, 2, tzinfo=UTC))
+    u = await users.create(session, name="ada", joined=datetime(2026, 1, 2))
     await users.update(session, u.id, name="grace")
     await users.delete(session, u.id)
     await session.commit()

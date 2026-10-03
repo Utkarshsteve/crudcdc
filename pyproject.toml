@@ -31,7 +31,14 @@ postgres = ["asyncpg>=0.31"]
 Repository = "https://github.com/Utkarshsteve/crudcdc"
 
 [dependency-groups]
-dev = ["pytest>=9.1", "pytest-asyncio>=1.4", "aiosqlite>=0.22", "ruff>=0.14", "mypy>=1.18"]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "aiosqlite>=0.22",
+    "ruff>=0.14",
+    "mypy>=1.18",
+    "asyncpg>=0.31.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]

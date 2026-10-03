@@ -53,15 +53,15 @@ Unchanged from [[Design-Decisions]]: async only, Python ≥3.11, SQLAlchemy ≥2
 ```python
 @dataclass(frozen=True, slots=True)
 class ChangeEvent:
-    seq: int                          # unique event id (not the cursor; see D5a)
+    seq: int  # unique event id (not the cursor; see D5a)
     op: Literal["insert", "update", "delete"]
-    table: str                        # Table.fullname: "users", or "billing.invoices" with a schema
-    pk: dict[str, Any]                # {"id": 5}; composite: {"org_id": 1, "user_id": 7}
-    before: dict[str, Any] | None     # None for insert, and for update/delete when track_before=False
-    after: dict[str, Any] | None      # None for delete
-    changed: tuple[str, ...]          # update: changed column names; insert/delete: ()
-    tx_id: str                        # same value for every event of one transaction
-    changed_at: datetime              # UTC, database clock (see below)
+    table: str  # Table.fullname: "users", or "billing.invoices" with a schema
+    pk: dict[str, Any]  # {"id": 5}; composite: {"org_id": 1, "user_id": 7}
+    before: dict[str, Any] | None  # None for insert, and for update/delete when track_before=False
+    after: dict[str, Any] | None  # None for delete
+    changed: tuple[str, ...]  # update: changed column names; insert/delete: ()
+    tx_id: str  # same value for every event of one transaction
+    changed_at: datetime  # UTC, database clock (see below)
 ```
 
 - Keys in `pk`, `before`, `after` and `changed` are **database column names**.
