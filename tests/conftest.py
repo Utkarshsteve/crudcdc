@@ -9,9 +9,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from crudcdc import CDCBase
+from crudcdc import CDCBase, track
 
-from .models import Base
+from .models import Base, Note, Untracked
+
+track(Base)
+track(Note, track_before=False)
 
 PG_URL = os.environ.get("CRUDCDC_TEST_PG_URL")
 
@@ -26,7 +29,7 @@ async def engine(request: pytest.FixtureRequest, tmp_path) -> AsyncIterator[Asyn
         # A file, not :memory:, so several connections (concurrency tests) share one database.
         eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
     async with eng.begin() as conn:
-        for md in (CDCBase.metadata, Base.metadata):
+        for md in (CDCBase.metadata, Base.metadata, Untracked.metadata):
             await conn.run_sync(md.drop_all)
             await conn.run_sync(md.create_all)
     yield eng
