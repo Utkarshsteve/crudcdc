@@ -276,6 +276,8 @@ def _guard_bulk(state: ORMExecuteState) -> None:
         return
     # Model.__table__ statements carry no mappers, so check the target table as well.
     table = getattr(state.statement, "table", None)
+    if isinstance(table, Table) and table.metadata is CDCBase.metadata:
+        return  # crudcdc's own offsets (read_for, ack, forget): keeps the read path cheap
     tables = {cast(Table, m.local_table) for m in state.all_mappers if _track_before(m) is not None}
     if table is not None and table in _tracked_tables():
         tables.add(table)

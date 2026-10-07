@@ -71,6 +71,12 @@ then writing one raises `EncodingError` and the transaction rolls back.
   `insert/update/delete(User)`, upserts (`on_conflict_do_update` / `do_nothing`), and the same
   statements aimed at `User.__table__`. Add `.execution_options(crudcdc_untracked=True)` to run
   one anyway.
+- Core statements executed directly on a connection or engine, for example
+  `(await session.connection()).execute(insert(User), rows)`: they never pass through the
+  session, so crudcdc can't see them.
+- Statements built on a `Table` object other than the model's own (a reflected
+  `Table("users", MetaData(), autoload_with=...)` or a separate Core definition of the same
+  table): the guard recognises a tracked table by its model's `Table` object.
 - The legacy `Session.bulk_save_objects`, `bulk_insert_mappings` and `bulk_update_mappings`. They
   fire no SQLAlchemy events at all, so crudcdc can't capture them or even refuse them. Don't use
   them on tracked models.

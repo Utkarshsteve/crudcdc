@@ -5,13 +5,13 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, insert, update
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, aliased, mapped_column
 
-from crudcdc import CDCBase, Change, UntrackedWriteError, track
+from crudcdc import CDCBase, Change, ChangeFeed, UntrackedWriteError, capture, track
 
 from .helpers import events
 from .models import Base, Log, User
@@ -36,6 +36,10 @@ BYPASSES: dict[str, Stmt] = {
     "upsert do_nothing": lambda s: (
         upsert(s)(User).values(id=1, name="a").on_conflict_do_nothing(),
     ),
+    "insert(Model).from_select": lambda s: (
+        insert(User).from_select(["id", "name"], select(Log.id, Log.line)),
+    ),
+    "update(aliased(Model))": lambda s: (update(aliased(User)).values(name="b"),),
     "insert(Model.__table__)": lambda s: (insert(User.__table__), [{"id": 1, "name": "a"}]),
     "update(Model.__table__)": lambda s: (update(User.__table__).values(name="b"),),
     "delete(Model.__table__)": lambda s: (delete(User.__table__),),
@@ -105,3 +109,22 @@ async def test_legacy_bulk_methods_are_not_captured(session: AsyncSession) -> No
     await session.run_sync(lambda s: s.bulk_update_mappings(User, [{"id": 1, "name": "z"}]))
     await session.commit()
     assert await events(session) == []
+
+
+async def test_consumer_offsets_skip_the_tracked_table_lookup(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """read_for / ack / forget write crudcdc's own offsets: the guard must not walk every mapper."""
+    session.add(User(id=1, name="a"))
+    await session.commit()
+
+    def fail() -> set[object]:
+        raise AssertionError("_tracked_tables() called for crudcdc's own table")
+
+    monkeypatch.setattr(capture, "_tracked_tables", fail)
+    feed = ChangeFeed(session)
+    batch = await feed.read_for("c")
+    assert batch.next_cursor
+    await feed.ack("c", batch.next_cursor)
+    await feed.forget("c")
+    await session.commit()
