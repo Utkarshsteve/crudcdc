@@ -15,7 +15,7 @@ from sqlalchemy.orm import Mapper, ORMExecuteState, Session, UOWTransaction
 from sqlalchemy.orm.state import InstanceState
 
 from .errors import EncodingError, UntrackedWriteError
-from .models import Change
+from .models import CDCBase, Change
 
 _models: dict[Mapper[Any], bool] = {}  # mapper -> track_before
 _registries: dict[Any, bool] = {}  # registry of a tracked declarative base -> track_before
@@ -26,6 +26,8 @@ _TX = "_crudcdc_tx"
 def track(*targets: type[Any], track_before: bool = True) -> None:
     """Capture changes for these models, or for every model of a declarative base."""
     for target in targets:
+        if issubclass(target, CDCBase):
+            raise ValueError("crudcdc's own tables can't be tracked")
         if "__table__" not in vars(target) and "__tablename__" not in vars(target):
             _registries[target.registry] = track_before  # a base: models may be defined later
         else:
@@ -257,15 +259,30 @@ def _after_transaction_end(session: Session, transaction: Any) -> None:
         session.info.pop(_BEFORE, None)
 
 
+def _tracked_tables() -> set[Table]:
+    # Not cached: track(Base) allows models defined later, and a cache cleared only by track()
+    # would miss them. Runs only for DML statements; registries are small.
+    tables = {cast(Table, m.local_table) for m in _models}
+    for registry in _registries:
+        tables |= {cast(Table, m.local_table) for m in registry.mappers}
+    return tables
+
+
 def _guard_bulk(state: ORMExecuteState) -> None:
-    if not (state.is_update or state.is_delete):
+    """ORM DML on a tracked table bypasses the unit of work, so it would never reach the feed."""
+    if not (state.is_insert or state.is_update or state.is_delete):
         return
     if state.execution_options.get("crudcdc_untracked"):
         return
-    for mapper in state.all_mappers:
-        if _track_before(mapper) is not None:
-            raise UntrackedWriteError(
-                f"bulk {'UPDATE' if state.is_update else 'DELETE'} on tracked table "
-                f"{_table(mapper)!r} would not appear in the change feed; "
-                "use ORM objects, or .execution_options(crudcdc_untracked=True) to skip capture"
-            )
+    # Model.__table__ statements carry no mappers, so check the target table as well.
+    table = getattr(state.statement, "table", None)
+    tables = {cast(Table, m.local_table) for m in state.all_mappers if _track_before(m) is not None}
+    if table is not None and table in _tracked_tables():
+        tables.add(table)
+    if tables:
+        kind = "INSERT / upsert" if state.is_insert else "UPDATE" if state.is_update else "DELETE"
+        raise UntrackedWriteError(
+            f"bulk {kind} on tracked table {min(t.fullname for t in tables)!r} would not appear "
+            "in the change feed; use ORM objects, or .execution_options(crudcdc_untracked=True) "
+            "to skip capture"
+        )
