@@ -77,9 +77,23 @@ then writing one raises `EncodingError` and the transaction rolls back.
 ## Not captured
 
 - Raw SQL (`text(...)`) and writes from other services.
-- Bulk ORM statements (`update(User)...`, `delete(User)...`). On a tracked table these **raise**
-  `UntrackedWriteError`; add `.execution_options(crudcdc_untracked=True)` to run one anyway.
+- Bulk ORM statements bypass the unit of work, so on a tracked table they **raise**
+  `UntrackedWriteError` instead of writing silently: `insert(User)` with a list of rows,
+  `insert/update/delete(User)`, upserts (`on_conflict_do_update` / `do_nothing`), and the same
+  statements aimed at `User.__table__`. Add `.execution_options(crudcdc_untracked=True)` to run
+  one anyway.
+- Core statements executed directly on a connection or engine, for example
+  `(await session.connection()).execute(insert(User), rows)`: they never pass through the
+  session, so crudcdc can't see them.
+- Statements built on a `Table` object other than the model's own (a reflected
+  `Table("users", MetaData(), autoload_with=...)` or a separate Core definition of the same
+  table): the guard recognises a tracked table by its model's `Table` object.
+- The legacy `Session.bulk_save_objects`, `bulk_insert_mappings` and `bulk_update_mappings`. They
+  fire no SQLAlchemy events at all, so crudcdc can't capture them or even refuse them. Don't use
+  them on tracked models.
 - Database-level `ON DELETE CASCADE` with `passive_deletes=True`.
+
+crudcdc's own tables (`CDCBase`) can't be tracked: `track(CDCBase)` raises `ValueError`.
 
 On Postgres, a long-running transaction holds back events committed after it started, until it
 ends. That's what guarantees no consumer skips an event.
