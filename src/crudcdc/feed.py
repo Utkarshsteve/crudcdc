@@ -10,7 +10,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import delete, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from .errors import InvalidCursorError
 from .models import Change, ConsumerOffset
@@ -69,12 +69,33 @@ def _event(c: Change) -> ChangeEvent:
 
 
 class ChangeFeed:
-    def __init__(self, session: AsyncSession) -> None:
+    """The change feed of one database.
+
+    ``bind`` names which database to read when the session spans several (``binds={...}``);
+    by default it's the session's own bind.
+    """
+
+    def __init__(self, session: AsyncSession, *, bind: AsyncEngine | None = None) -> None:
+        if bind is not None and not isinstance(bind, AsyncEngine):
+            raise TypeError(
+                f"bind must be an AsyncEngine, not {type(bind).__name__}: a connection's "
+                "transaction isn't owned by the session, so their commits could disagree"
+            )
         self.session = session
+        # bind_arguments needs the sync engine; an AsyncEngine fails with AsyncContextNotStarted.
+        self._bind = None if bind is None else bind.sync_engine
 
     @property
     def _dialect(self) -> str:
-        return self.session.get_bind().dialect.name
+        return (self._bind or self.session.get_bind()).dialect.name
+
+    async def _execute(self, stmt: Any, **kw: Any) -> Any:
+        if self._bind is not None:
+            kw["bind_arguments"] = {"bind": self._bind}
+        return await self.session.execute(stmt, **kw)
+
+    async def _scalar(self, stmt: Any) -> Any:
+        return (await self._execute(stmt)).scalar()
 
     async def read(
         self, since: str | None = None, *, limit: int = 100, tables: Sequence[str] | None = None
@@ -96,7 +117,7 @@ class ChangeFeed:
         if self._dialect == "postgresql":
             # Only transactions older than every running one: nothing can commit behind us.
             stmt = stmt.where(Change.xid < _PG_XMIN)
-        rows = (await self.session.execute(stmt)).scalars().all()
+        rows = (await self._execute(stmt)).scalars().all()
         if not rows:
             return Batch((), since)
         return Batch(tuple(_event(c) for c in rows), _token((rows[-1].xid, rows[-1].seq)))
@@ -112,7 +133,7 @@ class ChangeFeed:
         """
         await self._ensure(consumer)
         if self._dialect == "postgresql":
-            row = await self.session.scalar(
+            row = await self._scalar(
                 select(ConsumerOffset)
                 .where(ConsumerOffset.consumer == consumer)
                 .with_for_update(skip_locked=True)
@@ -121,7 +142,7 @@ class ChangeFeed:
                 return Batch((), await self.offset(consumer))
         else:
             # No row locks in SQLite: a no-op write takes the database write lock instead.
-            await self.session.execute(
+            await self._execute(
                 update(ConsumerOffset)
                 .where(ConsumerOffset.consumer == consumer)
                 .values(seq=ConsumerOffset.seq)
@@ -132,18 +153,18 @@ class ChangeFeed:
 
     async def _ensure(self, consumer: str) -> None:
         # Check first: inserting over a row another worker holds would block on its lock.
-        exists = await self.session.scalar(
+        exists = await self._scalar(
             select(ConsumerOffset.consumer).where(ConsumerOffset.consumer == consumer)
         )
         if exists is not None:
             return
         ins = pg_insert if self._dialect == "postgresql" else sqlite_insert
         stmt = ins(ConsumerOffset).values(consumer=consumer, xid=0, seq=0)
-        await self.session.execute(stmt.on_conflict_do_nothing())
+        await self._execute(stmt.on_conflict_do_nothing())
 
     async def _position(self, consumer: str) -> Position:
         row = (
-            await self.session.execute(
+            await self._execute(
                 select(ConsumerOffset.xid, ConsumerOffset.seq).where(
                     ConsumerOffset.consumer == consumer
                 )
@@ -160,7 +181,7 @@ class ChangeFeed:
         """Record that ``consumer`` processed everything up to ``cursor``. Never moves back."""
         pos = _parse(cursor)
         await self._ensure(consumer)
-        await self.session.execute(
+        await self._execute(
             update(ConsumerOffset)
             .where(
                 ConsumerOffset.consumer == consumer,
@@ -172,7 +193,7 @@ class ChangeFeed:
 
     async def forget(self, consumer: str) -> None:
         """Drop a consumer's offset, so it no longer holds back ``prune``."""
-        await self.session.execute(
+        await self._execute(
             delete(ConsumerOffset)
             .where(ConsumerOffset.consumer == consumer)
             .execution_options(synchronize_session=False)
@@ -184,7 +205,7 @@ class ChangeFeed:
             older_than = older_than.astimezone(UTC).replace(tzinfo=None)
         stmt = delete(Change).where(Change.changed_at < older_than)
         slowest = (
-            await self.session.execute(
+            await self._execute(
                 select(ConsumerOffset.xid, ConsumerOffset.seq)
                 .order_by(ConsumerOffset.xid, ConsumerOffset.seq)
                 .limit(1)
@@ -192,5 +213,5 @@ class ChangeFeed:
         ).first()
         if slowest is not None:
             stmt = stmt.where(tuple_(Change.xid, Change.seq) <= tuple_(*slowest))
-        result = await self.session.execute(stmt, execution_options={"synchronize_session": False})
-        return cast(int, result.rowcount or 0)  # type: ignore[attr-defined]
+        result = await self._execute(stmt, execution_options={"synchronize_session": False})
+        return cast(int, result.rowcount or 0)
