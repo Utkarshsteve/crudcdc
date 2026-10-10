@@ -50,7 +50,9 @@ A session bound to several databases (`binds={User: users_db, Invoice: billing_d
 - Run `CDCBase.metadata.create_all` in **every** database that holds tracked tables. Each
   change row is written to its model's own database, so it commits with that data.
 - Each database has its own feed. Name the one to read: `ChangeFeed(session, bind=billing_db)`
-  (an `AsyncEngine`). Without `bind`, the feed uses the session's default bind.
+  (an `AsyncEngine`). Without `bind`, the feed reads where the session sends `CDCBase`
+  (`binds={CDCBase: ...}`), else the default bind. Binding `CDCBase` doesn't move change rows:
+  they always go to their model's database.
 - Each database commits its data and its change rows atomically, but there is **no atomicity
   across databases** unless the session uses `twophase=True`. Sharded sessions aren't supported.
 

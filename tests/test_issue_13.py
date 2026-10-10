@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -60,9 +61,12 @@ async def engines(request: pytest.FixtureRequest, tmp_path) -> AsyncIterator[Eng
         await eng.dispose()
 
 
-def _sessions(a: AsyncEngine, b: AsyncEngine, default: bool) -> async_sessionmaker[AsyncSession]:
+def _sessions(
+    a: AsyncEngine, b: AsyncEngine, default: bool, cdc: AsyncEngine | None = None
+) -> async_sessionmaker[AsyncSession]:
     kw = {"bind": a} if default else {}
-    return async_sessionmaker(binds={User: a, Account: b}, expire_on_commit=False, **kw)
+    binds: dict[type, AsyncEngine] = {User: a, Account: b} | ({CDCBase: cdc} if cdc else {})
+    return async_sessionmaker(binds=binds, expire_on_commit=False, **kw)
 
 
 async def _change_tables(eng: AsyncEngine) -> list[tuple[str, str]]:
@@ -103,6 +107,9 @@ async def test_change_rows_go_to_each_models_database(engines: Engines, default:
             {"id": 1, "display_name": "x"},
             {"id": 1, "display_name": "y"},
         )
+    async with a.connect() as ca, b.connect() as cb:  # one commit, but a transaction per database
+        first = select(Change.tx_id).order_by(Change.seq).limit(1)
+        assert await ca.scalar(first) != await cb.scalar(first)
 
 
 @pytest.mark.parametrize("default", [True, False], ids=["default-bind", "no-default-bind"])
@@ -133,3 +140,42 @@ async def test_bind_must_be_an_async_engine(engines: Engines) -> None:
     async with _sessions(a, b, True)() as s, b.connect() as conn:
         with pytest.raises(TypeError, match="AsyncEngine"):
             ChangeFeed(s, bind=conn)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("default", [True, False], ids=["default-bind", "no-default-bind"])
+async def test_feed_without_bind_reads_the_default_bind(engines: Engines, default: bool) -> None:
+    a, b = engines
+    async with _sessions(a, b, default)() as s:
+        s.add_all([User(id=1, name="u"), Account(id=1, display="x")])
+        await s.commit()
+        if default:
+            assert [e.table for e in (await ChangeFeed(s).read()).events] == ["users"]
+        else:
+            with pytest.raises(UnboundExecutionError):
+                await ChangeFeed(s).read()
+
+
+@pytest.mark.parametrize("default", [True, False], ids=["default-bind", "no-default-bind"])
+async def test_feed_without_bind_follows_a_cdcbase_bind(engines: Engines, default: bool) -> None:
+    """``binds={CDCBase: b}`` sends the feed's statements to B: its dialect must be B's too."""
+    a, b = engines
+    sessions = _sessions(a, b, default, cdc=b)
+    async with sessions() as s:
+        s.add(Account(id=1, display="x"))
+        await s.commit()
+        feed = ChangeFeed(s)
+        batch = await feed.read_for("audit")
+        assert [e.table for e in batch.events] == ["accounts"]
+        assert batch.next_cursor
+        await feed.ack("audit", batch.next_cursor)
+        await s.commit()
+        assert await feed.offset("audit") == batch.next_cursor
+
+    if b.dialect.name != "postgresql":
+        return
+    async with sessions() as open_tx, sessions() as s:  # Postgres' hold-back must apply
+        open_tx.add(Account(id=2, display="y"))
+        await open_tx.flush()
+        s.add(Account(id=3, display="z"))
+        await s.commit()
+        assert (await ChangeFeed(s).read(batch.next_cursor)).events == ()

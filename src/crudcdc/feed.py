@@ -72,7 +72,8 @@ class ChangeFeed:
     """The change feed of one database.
 
     ``bind`` names which database to read when the session spans several (``binds={...}``);
-    by default it's the session's own bind.
+    by default it's where the session sends crudcdc's tables: a ``CDCBase`` bind, else the
+    default bind.
     """
 
     def __init__(self, session: AsyncSession, *, bind: AsyncEngine | None = None) -> None:
@@ -87,7 +88,7 @@ class ChangeFeed:
 
     @property
     def _dialect(self) -> str:
-        return (self._bind or self.session.get_bind()).dialect.name
+        return (self._bind or self.session.get_bind(Change)).dialect.name
 
     async def _execute(self, stmt: Any, **kw: Any) -> Any:
         if self._bind is not None:

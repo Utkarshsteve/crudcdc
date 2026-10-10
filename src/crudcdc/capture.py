@@ -245,7 +245,8 @@ def _write_changes(session: Session, conn: Connection, rows: list[dict[str, Any]
             tx_id=literal_column("pg_current_xact_id()::text"),
         )
     else:
-        tx_id = session.info.setdefault(_TX, uuid.uuid4().hex)
+        # One per database: each commits its own transaction, as each Postgres xid is distinct.
+        tx_id = session.info.setdefault(_TX, {}).setdefault(conn.engine, uuid.uuid4().hex)
         rows = [{**r, "xid": 0, "tx_id": tx_id} for r in rows]
     conn.execute(stmt, rows)
 
