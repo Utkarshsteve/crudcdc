@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any, cast
 
-from sqlalchemy import Table, event, insert, inspect, literal_column, select
+from sqlalchemy import Connection, Table, event, insert, inspect, literal_column, select
 from sqlalchemy.orm import Mapper, ORMExecuteState, Session, UOWTransaction
 from sqlalchemy.orm.state import InstanceState
 
@@ -142,7 +142,8 @@ def _old_values(session: Session, state: InstanceState[Any], keys: list[str]) ->
         mapper = state.mapper
         cols = [mapper.get_property(k).columns[0] for k in unknown]
         where = [c == v for c, v in zip(mapper.primary_key, state.identity or (), strict=True)]
-        row = session.connection().execute(select(*cols).where(*where)).one()
+        conn = session.connection(bind_arguments={"mapper": mapper})  # the model's own database
+        row = conn.execute(select(*cols).where(*where)).one()
         values.update(zip(unknown, row, strict=True))
     return values
 
@@ -196,12 +197,14 @@ def _after_flush(session: Session, _ctx: UOWTransaction) -> None:
     def rank(state: InstanceState[Any]) -> int:
         return ranks.get(cast(Table, state.mapper.local_table), 0)
 
-    rows: list[dict[str, Any]] = []
+    rows: list[tuple[Mapper[Any], dict[str, Any]]] = []
     # Flush order: parents before children for inserts/updates, children first for deletes.
     for state in sorted(new, key=rank):
         if _track_before(state.mapper) is not None:
             after = _row(state, _current(state))
-            rows.append(_change("insert", state, None, after, (), _pk(state, after)))
+            rows.append(
+                (state.mapper, _change("insert", state, None, after, (), _pk(state, after)))
+            )
     for state in sorted(dirty, key=rank):
         keep_before = _track_before(state.mapper)
         if keep_before is None or state not in befores:
@@ -210,18 +213,30 @@ def _after_flush(session: Session, _ctx: UOWTransaction) -> None:
         changed = tuple(k for k in after if k in before and after[k] != before[k])
         if changed:
             kept = before if keep_before else None
-            rows.append(_change("update", state, kept, after, changed, _pk(state, after)))
+            row = _change("update", state, kept, after, changed, _pk(state, after))
+            rows.append((state.mapper, row))
     for state in sorted(deleted, key=rank, reverse=True):
         keep_before = _track_before(state.mapper)
         if keep_before is None or state not in befores:
             continue
         before = befores[state]
-        rows.append(
-            _change("delete", state, before if keep_before else None, None, (), _pk(state, before))
-        )
+        kept = before if keep_before else None
+        rows.append((state.mapper, _change("delete", state, kept, None, (), _pk(state, before))))
     if not rows:
         return
-    conn = session.connection()
+    # Each change row goes to its model's own database, so it commits with that data (#13).
+    # The bind is looked up once per mapper, not per row; most sessions have a single group.
+    bind_of: dict[Mapper[Any], Any] = {}
+    groups: dict[Any, tuple[Mapper[Any], list[dict[str, Any]]]] = {}
+    for mapper, row in rows:
+        if mapper not in bind_of:
+            bind_of[mapper] = session.get_bind(mapper=mapper)
+        groups.setdefault(bind_of[mapper], (mapper, []))[1].append(row)
+    for mapper, group in groups.values():
+        _write_changes(session, session.connection(bind_arguments={"mapper": mapper}), group)
+
+
+def _write_changes(session: Session, conn: Connection, rows: list[dict[str, Any]]) -> None:
     stmt = insert(Change)
     if conn.dialect.name == "postgresql":
         # The database fills in the transaction id: no separate round trip to fetch it.
@@ -230,7 +245,8 @@ def _after_flush(session: Session, _ctx: UOWTransaction) -> None:
             tx_id=literal_column("pg_current_xact_id()::text"),
         )
     else:
-        tx_id = session.info.setdefault(_TX, uuid.uuid4().hex)
+        # One per database: each commits its own transaction, as each Postgres xid is distinct.
+        tx_id = session.info.setdefault(_TX, {}).setdefault(conn.engine, uuid.uuid4().hex)
         rows = [{**r, "xid": 0, "tx_id": tx_id} for r in rows]
     conn.execute(stmt, rows)
 

@@ -43,6 +43,19 @@ committing, the batch is delivered again.
 - `prune(older_than)` deletes old events, never past the slowest consumer. `forget(name)` drops a
   consumer that no longer exists.
 
+## Several databases
+
+A session bound to several databases (`binds={User: users_db, Invoice: billing_db}`) works:
+
+- Run `CDCBase.metadata.create_all` in **every** database that holds tracked tables. Each
+  change row is written to its model's own database, so it commits with that data.
+- Each database has its own feed. Name the one to read: `ChangeFeed(session, bind=billing_db)`
+  (an `AsyncEngine`). Without `bind`, the feed reads where the session sends `CDCBase`
+  (`binds={CDCBase: ...}`), else the default bind. Binding `CDCBase` doesn't move change rows:
+  they always go to their model's database.
+- Each database commits its data and its change rows atomically, but there is **no atomicity
+  across databases** unless the session uses `twophase=True`. Sharded sessions aren't supported.
+
 ## Events
 
 ```python
